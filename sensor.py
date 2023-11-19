@@ -1,96 +1,110 @@
-ean = "xxxxxxxxxxxxxxxxxx"
-client_id = "cccccccccccccccccccccccccccccccc"
-client_secret = "vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv"
+"""
+Script stáhne 7 dní starý záznam o generaci a spotřebě elektřiny od EGD
+
+Ve formátu JSON který je možno zpracovat pomocí Home Assistant
+EGD má pouze stará data, což je promblém pro HA, který umí nativně
+zaznamenávat pouze aktuální data
+
+Příklad výstupu scriptu:
+    {
+        "error": 0,
+        "data": "2023-11-12",
+        "ICH1": 21.91,
+        "ICH1_size": 24,
+        "ISH1": 1.7925000000000002,
+        "ISH1_size": 24
+    }
+
+EGD OpenApi přiručka – vzdálený přístup
+https://portal.distribuce24.cz/download/Uzivatelsky_navod_OpenApi.pdf
+"""
+
+# Fill in/Vypln
+##################################################
+EAN = "xxxxxxxxxxxxxxxxxx"
+CLIENT_ID = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+CLIENT_SECRET = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+##################################################
 
 from datetime import datetime, timedelta
 import requests
 import json
 
-day_delay=4
+# EGD ma velke zpozdeni a nebo nemaji vsechna data pro cely den
+# Proto predleva 7 dnu
+day_delay = 7
 dnes = datetime.now().date()
-start = dnes - timedelta(days=(day_delay))
-end = dnes - timedelta(days=(day_delay-1))
+start = (dnes - timedelta(days=day_delay)).isoformat()
+end = (dnes - timedelta(days=day_delay - 1)).isoformat()
 
-dnes = dnes.isoformat()
-start = start.isoformat()
-end = end.isoformat()
-
-# Get Access token - form
+# Get Access token
 url = "https://idm.distribuce24.cz/oauth/token"
-headers = {
-    'Content-Type': 'application/json',
-}
 data = {
     "grant_type": "client_credentials",
-    "client_id": client_id,
-    "client_secret": client_secret,
+    "client_id": CLIENT_ID,
+    "client_secret": CLIENT_SECRET,
     "scope": "namerena_data_openapi",
 }
-
-# Get Access token - action
 response = requests.post(url, json=data)
-#print(response)
-#print(response.content)
+#print(url, data, response, response.status_code, response.content)
 access_token = json.loads(response.content)["access_token"]
 
-# Get total consumption/generation - request form + sccess header
+# Authorization header for data polling
 url = "https://data.distribuce24.cz/rest/spotreby"
 headers = {
-    "Authorization": f"Bearer {access_token}",
+    "Authorization": "Bearer {}".format(access_token),
 }
-requests_eon = {
-    "consumption": {
-        "ean": ean,
-        "profile": "ICH1",
-        "from": f"{start}T00:01:00.000Z",
-        "to":   f"{end}T00:00:00.000Z",
-        "PageStart": 0,
-        "PageSize": 24
-    },
-    "generation": {
-        "ean": ean,
-        "profile": "ISH1",
-        "from": f"{start}T00:01:00.000Z",
-        "to":   f"{end}T00:00:00.000Z",
-        "PageStart": 0,
-        "PageSize": 24,
+
+#Hourly electricity consumption - ICH1"
+#Hourly electricity generation - ISH1"
+profiles = ["ICH1","ISH1"]
+
+#Create egd poll requests
+requests_eon = {}
+for profile in profiles:
+    requests_eon[profile] = {
+        "ean": EAN,
+        "profile": profile,
+        "from": "{}T00:01:00.000Z".format(start),
+        "to":   "{}T00:00:00.000Z".format(end),
+        "pagestart": 0,
+        "pagesize": 24*4
     }
-}
 
-# Get total consumption/generation - action
-chyba = 0
-total = {"consumption":0, "generation":0, "error":0, "consumption_size:":-1, "generation_size:":-1}  
+# Set inital values in case of error
+total = {"error": 0, "date": start}
 for request_eon in requests_eon:
+    total[request_eon] = 0
+    total['{}_size'.format(request_eon)] = -1
 
+# Get data points and sum for profiles of selected day
+for request_eon in requests_eon:
     try:
-        response_cons = requests.get(url, headers=headers, params=requests_eon[request_eon])
-        #print("Request completed with status code:", response_cons.status_code)
-        #print("Content:", response_cons.content)
-        data = json.loads(response_cons.content)
+        response = requests.get(url, headers=headers, params=requests_eon[request_eon])
+        #print("\n", url, headers, requests_eon[request_eon], response, response.status_code, response.content)
+        response.raise_for_status()  # Raise HTTPError for bad responses
+        data = json.loads(response.content)
 
-        # Save
-        with open(f'{request_eon}.txt', 'w') as file:
+        # Save all data for given profile
+        with open('{}.txt'.format(request_eon), 'w') as file:
             file.write(json.dumps(data, indent=4))
 
         # Iterate through the data and sum the "value" field
         for entry in data:
-            if(request_eon=="consumption"):
-                total["consumption_size"] = entry['total']
-            if(request_eon=="generation"):
-                total["generation_size"] = entry['total']
-                
-            assert(entry['total'] == 24)
-            
+            total['{}_size'.format(request_eon)] = entry['total']
+            assert(entry['total'] in {24, 24*4})
             for timestamp_data in entry['data']:
                 total[request_eon] += timestamp_data['value']
-    except:
-        total[request_eon] = 0
+                
+    except Exception as e:
+        #print("Fail:", e)
         total["error"] = 1
 
-print(json.dumps(total))
+print(json.dumps(total, indent=4))
 with open('egd_data.json', 'w') as file:
     file.write(json.dumps(total, indent=4))
 
 ## Available profiles
 #profiles =  json.loads(requests.get(url="https://data.distribuce24.cz/rest/profily", headers=headers).content)
 #print(json.dumps(profiles, indent=4))
+
